@@ -1,5 +1,3 @@
-// This is not working properly
-
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime.h>
@@ -14,33 +12,44 @@
         } \
     } while (0)
 
-__global__ void mp_kernel(int *X, int *Y, int *start, int *finished,
+__device__ volatile int X = 0, Y = 0, rX = -1, rY = -1;
+
+__device__ void time_noise(){
+    for (int i = 0; i < (clock64() & 0xFF); i++) {asm volatile("");}
+}
+
+__global__ void lb_kernel(int *start, int *finished,
                           int *counter00, int *counter01,
                           int *counter10, int *counter11)
 {
-    int tid = threadIdx.x;
-    int rY = -1;
-    int rX = -1;
-    printf("HELLO\n");
+    int tid = blockIdx.x;
+    // int rY = -1;
+    // int rX = -1;
 
-    // sync before start the test
+    // Simple barrier: increment start and wait for all threads
     atomicAdd(start, 1);
     while (atomicAdd(start, 0) < 2) {}
 
+    time_noise();
+
     if (tid == 0) {
-        *X = 1;
-        *Y = 1;
+        // Writer: store data then flag
+        rX = X;
+        time_noise();
+        Y = 1;
     } else {
-        while(atomicAdd(Y, 0) == 0){} //somehow the program stucks here.
-        rY = *Y;
-        rX = *X;
+        // Reader: read flag and data
+        rY = Y;
+        time_noise();
+        X = 1;
     }
 
-
+    // Device-side barrier: mark finished
     atomicAdd(finished, 1);
     while (atomicAdd(finished, 0) < 2) {}
 
     if (tid == 1) {
+        // Count all 4 possible outcomes
         if (rY == 0 && rX == 0) atomicAdd(counter00, 1);
         if (rY == 0 && rX == 1) atomicAdd(counter01, 1);
         if (rY == 1 && rX == 0) atomicAdd(counter10, 1);
@@ -50,7 +59,7 @@ __global__ void mp_kernel(int *X, int *Y, int *start, int *finished,
 
 int main(int argc, char **argv)
 {
-    long long iterations = 1000;
+    long long iterations = 1000000;
     if (argc >= 2) iterations = atoll(argv[1]);
 
     printf("Message Passing Litmus: %lld iterations\n", iterations);
@@ -81,7 +90,10 @@ int main(int argc, char **argv)
         CUDA_CHECK(cudaMemcpy(d_counter10, &zero, sizeof(int), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_counter11, &zero, sizeof(int), cudaMemcpyHostToDevice));
 
-        mp_kernel<<<1, 2>>>(d_X, d_Y, d_start, d_finished,
+        cudaMemcpyToSymbol(X, &zero, sizeof(int));
+        cudaMemcpyToSymbol(Y, &zero, sizeof(int));
+
+        lb_kernel<<<2, 1>>>(d_start, d_finished,
                             d_counter00, d_counter01, d_counter10, d_counter11);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -95,7 +107,7 @@ int main(int argc, char **argv)
         host_10 += tmp;
         CUDA_CHECK(cudaMemcpy(&tmp, d_counter11, sizeof(int), cudaMemcpyDeviceToHost));
         host_11 += tmp;
-    
+
         if ((i + 1) % 100000 == 0) {
             printf("After %lld iterations:\n", i + 1);
             printf("(rY,rX)=(0,0): %d\n", host_00);
